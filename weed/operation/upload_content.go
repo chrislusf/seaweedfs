@@ -59,7 +59,8 @@ func init() {
 	HttpClient = &http.Client{Transport: &http.Transport{
 		MaxIdleConns:        1024,
 		MaxIdleConnsPerHost: 1024,
-	}}
+	},
+		Timeout: time.Duration(2 * time.Second)}
 }
 
 var fileNameEscaper = strings.NewReplacer(`\`, `\\`, `"`, `\"`)
