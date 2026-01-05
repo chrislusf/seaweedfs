@@ -3,6 +3,7 @@ package erasure_coding
 import (
 	"fmt"
 	"sort"
+	"sync"
 
 	"github.com/dustin/go-humanize"
 	"github.com/seaweedfs/seaweedfs/weed/pb/master_pb"
@@ -16,6 +17,7 @@ type ShardInfo struct {
 	Size ShardSize
 }
 type ShardsInfo struct {
+	mu     sync.RWMutex
 	shards map[ShardId]*ShardInfo
 }
 
@@ -74,6 +76,8 @@ func ShardsCountFromVolumeEcShardInformationMessage(vi *master_pb.VolumeEcShardI
 
 // Returns a string representation for a ShardsInfo.
 func (sp *ShardsInfo) String() string {
+	sp.mu.RLock()
+	defer sp.mu.RUnlock()
 	var res string
 	ids := sp.Ids()
 	for i, id := range sp.Ids() {
@@ -87,6 +91,8 @@ func (sp *ShardsInfo) String() string {
 
 // AsSlice converts a ShardsInfo to a slice of ShardInfo structs, ordered by shard ID.
 func (si *ShardsInfo) AsSlice() []*ShardInfo {
+	si.mu.RLock()
+	defer si.mu.RUnlock()
 	res := make([]*ShardInfo, len(si.shards))
 	i := 0
 	for _, id := range si.Ids() {
@@ -99,17 +105,23 @@ func (si *ShardsInfo) AsSlice() []*ShardInfo {
 
 // Count returns the number of EC shards.
 func (si *ShardsInfo) Count() int {
+	si.mu.RLock()
+	defer si.mu.RUnlock()
 	return len(si.shards)
 }
 
 // Has verifies if a shard ID is present.
 func (si *ShardsInfo) Has(id ShardId) bool {
+	si.mu.RLock()
+	defer si.mu.RUnlock()
 	_, ok := si.shards[id]
 	return ok
 }
 
 // Ids returns a list of shard IDs, in ascending order.
 func (si *ShardsInfo) Ids() []ShardId {
+	si.mu.RLock()
+	defer si.mu.RUnlock()
 	ids := []ShardId{}
 	for id := range si.shards {
 		ids = append(ids, id)
@@ -140,6 +152,8 @@ func (si *ShardsInfo) Set(id ShardId, size ShardSize) {
 	if id >= MaxShardCount {
 		return
 	}
+	si.mu.Lock()
+	defer si.mu.Unlock()
 	si.shards[id] = &ShardInfo{
 		Id:   id,
 		Size: size,
@@ -151,6 +165,8 @@ func (si *ShardsInfo) Delete(id ShardId) {
 	if id >= MaxShardCount {
 		return
 	}
+	si.mu.Lock()
+	defer si.mu.Unlock()
 	if _, ok := si.shards[id]; ok {
 		delete(si.shards, id)
 	}
@@ -158,6 +174,8 @@ func (si *ShardsInfo) Delete(id ShardId) {
 
 // Bitmap returns a bitmap for all existing shard IDs (bit 0 = shard #0... bit 31 = shard #31), in little endian.
 func (si *ShardsInfo) Bitmap() uint32 {
+	si.mu.RLock()
+	defer si.mu.RUnlock()
 	var bits uint32
 	for id := range si.shards {
 		bits |= (1 << id)
@@ -167,6 +185,8 @@ func (si *ShardsInfo) Bitmap() uint32 {
 
 // Size returns the size of a given shard ID, if present.
 func (si *ShardsInfo) Size(id ShardId) ShardSize {
+	si.mu.RLock()
+	defer si.mu.RUnlock()
 	if s, ok := si.shards[id]; ok {
 		return s.Size
 	}
@@ -175,6 +195,8 @@ func (si *ShardsInfo) Size(id ShardId) ShardSize {
 
 // TotalSize returns the size for all shards.
 func (si *ShardsInfo) TotalSize() ShardSize {
+	si.mu.RLock()
+	defer si.mu.RUnlock()
 	var total ShardSize
 	for _, s := range si.shards {
 		total += s.Size
@@ -184,6 +206,8 @@ func (si *ShardsInfo) TotalSize() ShardSize {
 
 // Sizes returns a compact slice of present shard sizes, from first to last.
 func (si *ShardsInfo) Sizes() []ShardSize {
+	si.mu.RLock()
+	defer si.mu.RUnlock()
 	ids := si.Ids()
 
 	res := make([]ShardSize, len(ids))
@@ -210,6 +234,8 @@ func (si *ShardsInfo) SizesInt64() []int64 {
 
 // Copy creates a copy of a ShardInfo.
 func (si *ShardsInfo) Copy() *ShardsInfo {
+	si.mu.RLock()
+	defer si.mu.RUnlock()
 	new := NewShardsInfo()
 	for _, s := range si.shards {
 		new.Set(s.Id, s.Size)
@@ -234,6 +260,8 @@ func (si *ShardsInfo) MinusParityShards() *ShardsInfo {
 
 // Add merges all shards from another ShardInfo into this one.
 func (si *ShardsInfo) Add(other *ShardsInfo) {
+	other.mu.RLock()
+	defer other.mu.RUnlock()
 	for _, s := range other.shards {
 		si.Set(s.Id, s.Size)
 	}
@@ -241,6 +269,8 @@ func (si *ShardsInfo) Add(other *ShardsInfo) {
 
 // Subtract removes all shards present on another ShardInfo.
 func (si *ShardsInfo) Subtract(other *ShardsInfo) {
+	other.mu.RLock()
+	defer other.mu.RUnlock()
 	for _, s := range other.shards {
 		si.Delete(s.Id)
 	}
