@@ -3,6 +3,7 @@ package app
 import (
 	"fmt"
 	"github.com/seaweedfs/seaweedfs/weed/admin/dash"
+	"github.com/seaweedfs/seaweedfs/weed/pb"
 )
 
 templ ClusterMasters(data dash.ClusterMastersData) {
@@ -110,7 +111,7 @@ templ ClusterMasters(data dash.ClusterMastersData) {
 								for _, master := range data.Masters {
 									<tr>
 										<td>
-											<a href={ templ.SafeURL(fmt.Sprintf("http://%s", master.Address)) } target="_blank" class="text-decoration-none">
+											<a href={ templ.SafeURL(fmt.Sprintf("http://%s", pb.ServerAddress(master.Address).ToHttpAddress())) } target="_blank" class="text-decoration-none">
 												{ master.Address }
 												<i class="fas fa-external-link-alt ms-1 text-muted"></i>
 											</a>
@@ -140,7 +141,7 @@ templ ClusterMasters(data dash.ClusterMastersData) {
 													class="btn btn-outline-primary btn-sm" 
 													title="View Details"
 													data-action="view-details"
-													data-address={master.Address}
+													data-address={pb.ServerAddress(master.Address).ToHttpAddress()}
 													data-leader={fmt.Sprintf("%t", master.IsLeader)}
 													data-suffrage={master.Suffrage}>
 												<i class="fas fa-eye"></i>

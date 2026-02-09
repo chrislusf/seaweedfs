@@ -4,6 +4,7 @@ import (
     "fmt"
     "strings"
     "github.com/seaweedfs/seaweedfs/weed/admin/dash"
+    "github.com/seaweedfs/seaweedfs/weed/pb"
 )
 
 templ ClusterVolumes(data dash.ClusterVolumesData) {
@@ -320,7 +321,7 @@ templ ClusterVolumes(data dash.ClusterVolumesData) {
                                             </code>
                                         </td>
                                         <td>
-                                            <a href={templ.SafeURL(fmt.Sprintf("http://%s/ui/index.html", volume.Server))} target="_blank" class="text-decoration-none">
+                                            <a href={templ.SafeURL(fmt.Sprintf("http://%s/ui/index.html", pb.ServerAddress(volume.Server).ToHttpAddress()))} target="_blank" class="text-decoration-none">
                                                 {volume.Server}
                                                 <i class="fas fa-external-link-alt ms-1 text-muted"></i>
                                             </a>

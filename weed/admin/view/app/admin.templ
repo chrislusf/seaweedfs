@@ -3,6 +3,7 @@ package app
 import (
     "fmt"
     "github.com/seaweedfs/seaweedfs/weed/admin/dash"
+    "github.com/seaweedfs/seaweedfs/weed/pb"
 )
 
 templ Admin(data dash.AdminData) {
@@ -173,7 +174,7 @@ templ Admin(data dash.AdminData) {
                                     for _, master := range data.MasterNodes {
                                         <tr>
                                             <td>
-                                                <a href={templ.SafeURL(fmt.Sprintf("http://%s/ui/index.html", master.Address))} target="_blank">
+                                                <a href={templ.SafeURL(fmt.Sprintf("http://%s/ui/index.html", pb.ServerAddress(master.Address).ToHttpAddress()))} target="_blank">
                                                     {master.Address}
                                                     <i class="fas fa-external-link-alt ms-1 text-muted"></i>
                                                 </a>
@@ -280,7 +281,7 @@ templ Admin(data dash.AdminData) {
                                         <tr>
                                             <td>{vs.ID}</td>
                                             <td>
-                                                <a href={templ.SafeURL(fmt.Sprintf("http://%s/ui/index.html", vs.GetDisplayAddress()))} target="_blank">
+                                                <a href={templ.SafeURL(fmt.Sprintf("http://%s/ui/index.html", pb.ServerAddress(vs.GetDisplayAddress()).ToHttpAddress()))} target="_blank">
                                                     {vs.GetDisplayAddress()}
                                                     <i class="fas fa-external-link-alt ms-1 text-muted"></i>
                                                 </a>
@@ -358,7 +359,7 @@ templ Admin(data dash.AdminData) {
                                     for _, filer := range data.FilerNodes {
                                         <tr>
                                             <td>
-                                                <a href={templ.SafeURL(fmt.Sprintf("http://%s", filer.Address))} target="_blank">
+                                                <a href={templ.SafeURL(fmt.Sprintf("http://%s", pb.ServerAddress(filer.Address).ToHttpAddress()))} target="_blank">
                                                     {filer.Address}
                                                     <i class="fas fa-external-link-alt ms-1 text-muted"></i>
                                                 </a>
@@ -394,4 +395,4 @@ templ Admin(data dash.AdminData) {
             </div>
         </div>
     </div>
-} 
+}

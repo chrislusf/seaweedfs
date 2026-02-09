@@ -3,6 +3,7 @@ package app
 import (
     "fmt"
     "github.com/seaweedfs/seaweedfs/weed/admin/dash"
+    "github.com/seaweedfs/seaweedfs/weed/pb"
 )
 
 templ ClusterVolumeServers(data dash.ClusterVolumeServersData) {
@@ -114,12 +115,12 @@ templ ClusterVolumeServers(data dash.ClusterVolumeServersData) {
                                     <tr>
                                         <td>
                                             if host.PublicURL != "" {
-                                                <a href={templ.SafeURL(fmt.Sprintf("http://%s/ui/index.html", host.PublicURL))} target="_blank" class="text-decoration-none">
+                                                <a href={templ.SafeURL(fmt.Sprintf("http://%s/ui/index.html", pb.ServerAddress(host.PublicURL).ToHttpAddress()))} target="_blank" class="text-decoration-none">
                                                     {host.Address}
                                                     <i class="fas fa-external-link-alt ms-1 text-muted"></i>
                                                 </a>
                                             } else {
-                                                <a href={templ.SafeURL(fmt.Sprintf("http://%s/ui/index.html", host.Address))} target="_blank" class="text-decoration-none">
+                                                <a href={templ.SafeURL(fmt.Sprintf("http://%s/ui/index.html", pb.ServerAddress(host.Address).ToHttpAddress()))} target="_blank" class="text-decoration-none">
                                                     {host.Address}
                                                     <i class="fas fa-external-link-alt ms-1 text-muted"></i>
                                                 </a>
@@ -178,8 +179,8 @@ templ ClusterVolumeServers(data dash.ClusterVolumeServersData) {
                                                         title="View Details"
                                                         data-action="view-details"
                                                         data-id={host.ID}
-                                                        data-address={host.Address}
-                                                        data-public-url={host.PublicURL}
+                                                        data-address={pb.ServerAddress(host.Address).ToHttpAddress()}
+                                                        data-public-url={pb.ServerAddress(host.PublicURL).ToHttpAddress()}
                                                         data-datacenter={host.DataCenter}
                                                         data-rack={host.Rack}
                                                         data-volumes={fmt.Sprintf("%d", host.Volumes)}
@@ -197,8 +198,8 @@ templ ClusterVolumeServers(data dash.ClusterVolumeServersData) {
                                                         title="View Details"
                                                         data-action="view-details"
                                                         data-id={host.ID}
-                                                        data-address={host.Address}
-                                                        data-public-url={host.Address}
+                                                        data-address={pb.ServerAddress(host.Address).ToHttpAddress()}
+                                                        data-public-url={pb.ServerAddress(host.Address).ToHttpAddress()}
                                                         data-datacenter={host.DataCenter}
                                                         data-rack={host.Rack}
                                                         data-volumes={fmt.Sprintf("%d", host.Volumes)}

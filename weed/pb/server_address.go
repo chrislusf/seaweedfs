@@ -57,6 +57,9 @@ func (sa ServerAddress) ToHttpAddress() string {
 	sepIndex := strings.LastIndex(string(ports), ".")
 	if sepIndex >= 0 {
 		host := string(sa[0:portsSepIndex])
+		if len(host) > 2 && host[0] == '[' && host[len(host)-1] == ']' {
+			host = host[1 : len(host)-1]
+		}
 		return net.JoinHostPort(host, ports[0:sepIndex])
 	}
 	return string(sa)

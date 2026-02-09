@@ -3,6 +3,7 @@ package app
 import (
 	"fmt"
 	"github.com/seaweedfs/seaweedfs/weed/admin/dash"
+	"github.com/seaweedfs/seaweedfs/weed/pb"
 )
 
 templ ClusterFilers(data dash.ClusterFilersData) {
@@ -68,8 +69,8 @@ templ ClusterFilers(data dash.ClusterFilersData) {
 								for _, filer := range data.Filers {
 									<tr>
 										<td>
-											<a href={ templ.SafeURL(fmt.Sprintf("http://%s", filer.Address)) } target="_blank" class="text-decoration-none">
-												{ filer.Address }
+											<a href={ templ.SafeURL(fmt.Sprintf("http://%s", pb.ServerAddress(filer.Address).ToHttpAddress())) } target="_blank" class="text-decoration-none">
+												{ pb.ServerAddress(filer.Address).ToHttpAddress() }
 												<i class="fas fa-external-link-alt ms-1 text-muted"></i>
 											</a>
 										</td>
@@ -91,7 +92,7 @@ templ ClusterFilers(data dash.ClusterFilersData) {
 										</td>
 										<td>
 											<div class="btn-group btn-group-sm" role="group">
-												<button type="button" class="btn btn-outline-secondary btn-sm" title="File Browser" data-action="open-filer" data-address={ filer.Address }>
+												<button type="button" class="btn btn-outline-secondary btn-sm" title="File Browser" data-action="open-filer" data-address={ pb.ServerAddress(filer.Address).ToHttpAddress() }>
 													<i class="fas fa-folder-open"></i>
 												</button>
 											</div>
