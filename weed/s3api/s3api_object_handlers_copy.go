@@ -375,7 +375,13 @@ func (s3a *S3ApiServer) CopyObjectHandler(w http.ResponseWriter, r *http.Request
 		dstDir, dstName := dstPath.DirAndName()
 
 		// Check if destination exists and remove it first (S3 copy overwrites)
-		if exists, _ := s3a.exists(dstDir, dstName, false); exists {
+		exists, err := s3a.exists(dstDir, dstName, false)
+		if err != nil {
+			glog.Errorf("CopyObjectHandler: failed to check destination %s/%s: %v", dstDir, dstName, err)
+			s3err.WriteErrorResponse(w, r, filerErrorToS3Error(err))
+			return
+		}
+		if exists {
 			if err := s3a.rmObject(dstDir, dstName, false, false); err != nil {
 				s3err.WriteErrorResponse(w, r, s3err.ErrInternalError)
 				return
