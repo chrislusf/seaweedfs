@@ -1272,6 +1272,10 @@ func runMini(cmd *Command, args []string) bool {
 	miniOptions.v.bindIp = miniBindIp
 	miniOptions.v.masters = pb.ServerAddresses(actualPeersForComponents).ToAddresses()
 	miniOptions.v.idleConnectionTimeout = miniTimeout
+	// Admin server binds to the same address as the other mini services.
+	// The public-bind-without-auth guard in `weed admin` does not apply here
+	// because mini calls startAdminServer directly, not runAdmin.
+	miniAdminOptions.ip = miniBindIp
 	miniOptions.v.dataCenter = miniDataCenter
 	miniOptions.v.rack = miniRack
 
