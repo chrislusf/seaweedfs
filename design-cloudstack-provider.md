@@ -297,7 +297,7 @@ The integration adds a **narrow S3 subresource** to SeaweedFS:
 - `PUT /{bucket}?seaweedfs-quota` — set bucket quota (IAM permission `s3:PutBucketQuota`)
 - `GET /{bucket}?seaweedfs-quota` — get bucket quota (IAM permission `s3:GetBucketQuota`)
 
-This is implemented in SeaweedFS PR #11279. It uses SigV4 authentication and
+This is implemented in SeaweedFS PR #11279 (merged). It uses SigV4 authentication and
 dedicated IAM permissions, so the CloudStack service credential can be scoped
 to quota management only — no global admin token, no cluster-wide admin access.
 The enforcement already exists (PR #10224); this PR only adds the HTTP
@@ -353,7 +353,7 @@ Java client.
 ## What changes on the SeaweedFS side
 
 **One narrow S3 extension is required for quota management.** SeaweedFS PR #11279
-adds the `?seaweedfs-quota` S3 subresource:
+(merged) adds the `?seaweedfs-quota` S3 subresource:
 
 - `PUT /{bucket}?seaweedfs-quota` — set bucket quota (IAM permission `s3:PutBucketQuota`)
 - `GET /{bucket}?seaweedfs-quota` — get bucket quota (IAM permission `s3:GetBucketQuota`)
@@ -380,7 +380,7 @@ gap:
    `weed iam` server on a different host/port.
 2. **Quota requirements.** Do proIO's customers need server-enforced per-bucket
    quotas, or is CloudStack-side accounting sufficient for the first release?
-   The `?seaweedfs-quota` S3 extension (PR #11279) provides server-enforced
+   The `?seaweedfs-quota` S3 extension (PR #11279, merged) provides server-enforced
    quotas via a scoped credential; this is the recommended path.
 3. **Object Lock.** `createBucket` takes an `objectLock` boolean. MinIO supports
    it; Ceph ignores it. SeaweedFS has Object Lock support. Should the plugin pass
@@ -406,7 +406,7 @@ All in the `apache/cloudstack` repo (new module):
 
 No files in `seaweedfs/seaweedfs` for the MVP.
 
-### SeaweedFS-side changes (PR #11279)
+### SeaweedFS-side changes (PR #11279, merged)
 
 | File | Purpose |
 | --- | --- |
