@@ -1120,10 +1120,6 @@ async fn get_or_head_handler_inner(
     };
 
     let (etag, last_modified_str) = etag_and_last_modified(&n);
-    // A Range whose If-Range no longer matches is ignored and the whole
-    // content is sent, so a resumed download restarts instead of mixing
-    // two versions.
-    let range = range.filter(|_| if_range_matches(&headers, &etag, &last_modified_str));
     if let Some(resp) = not_modified_response(&n, &headers, &etag, &last_modified_str) {
         // A request that ends here was answered by the meta read alone.
         if let Some(io_errors) = strategy.io_errors() {
@@ -1131,6 +1127,12 @@ async fn get_or_head_handler_inner(
         }
         return resp;
     }
+    let (mut response_headers, ext) =
+        read_response_headers(&n, &path, &query, &etag, &last_modified_str, ext);
+    // A Range whose If-Range no longer matches is ignored and the whole
+    // content is sent, so a resumed download restarts instead of mixing
+    // two versions.
+    let range = range.filter(|_| if_range_matches(&headers, &response_headers));
 
     // Chunk manifest expansion needs the full data.
     if n.is_chunk_manifest()
@@ -1159,9 +1161,6 @@ async fn get_or_head_handler_inner(
         };
     }
     // If manifest expansion fails (invalid JSON etc.), fall through to raw data
-
-    let (mut response_headers, ext) =
-        read_response_headers(&n, &path, &query, &etag, &last_modified_str, ext);
 
     match strategy {
         ReadStrategy::Stream(info) => {
@@ -1568,8 +1567,9 @@ fn not_modified_response(
 }
 
 /// If-Range (RFC 9110 13.1.5): an entity-tag by strong comparison, or a date
-/// equal to Last-Modified. The response etag here is always a strong tag.
-fn if_range_matches(headers: &HeaderMap, etag: &str, last_modified_str: &Option<String>) -> bool {
+/// equal to Last-Modified, both taken from the response headers so a stored
+/// pair that replaced them is what gets compared.
+fn if_range_matches(headers: &HeaderMap, response_headers: &HeaderMap) -> bool {
     let Some(raw) = headers.get(header::IF_RANGE) else {
         return true;
     };
@@ -1581,13 +1581,17 @@ fn if_range_matches(headers: &HeaderMap, etag: &str, last_modified_str: &Option<
         return true;
     }
     if if_range.starts_with('"') || if_range.starts_with("W/") {
-        return if_range == etag;
+        return response_headers
+            .get(header::ETAG)
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|etag| !etag.starts_with("W/") && if_range == etag);
     }
     let Ok(date) = httpdate::parse_http_date(if_range) else {
         return false;
     };
-    last_modified_str
-        .as_deref()
+    response_headers
+        .get(header::LAST_MODIFIED)
+        .and_then(|v| v.to_str().ok())
         .and_then(|lm| httpdate::parse_http_date(lm).ok())
         .is_some_and(|lm| date == lm)
 }
@@ -5705,6 +5709,23 @@ mod tests {
         (status, headers, body)
     }
 
+    async fn send_get_with(
+        state: &Arc<VolumeServerState>,
+        path: &str,
+        headers: &[(header::HeaderName, &str)],
+    ) -> (StatusCode, HeaderMap) {
+        use tower::ServiceExt;
+        let mut req = Request::builder().method(Method::GET).uri(path);
+        for (name, value) in headers {
+            req = req.header(name.clone(), *value);
+        }
+        let resp = super::super::volume_server::build_public_router(state.clone())
+            .oneshot(req.body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        (resp.status(), resp.headers().clone())
+    }
+
     /// The public router does not accept DELETE requests, so this calls the
     /// handler directly, the same way the admin router does.
     async fn send_delete(state: &Arc<VolumeServerState>, path: &str) -> StatusCode {
@@ -5792,8 +5813,12 @@ mod tests {
 
     #[test]
     fn test_if_range_matches() {
-        let etag = "\"v2\"".to_string();
-        let last_modified_str = Some("Sat, 24 Oct 2026 22:01:04 GMT".to_string());
+        let mut response_headers = HeaderMap::new();
+        response_headers.insert(header::ETAG, "\"v2\"".parse().unwrap());
+        response_headers.insert(
+            header::LAST_MODIFIED,
+            "Sat, 24 Oct 2026 22:01:04 GMT".parse().unwrap(),
+        );
         let cases: Vec<(Option<&str>, bool)> = vec![
             (None, true),
             (Some("\"v2\""), true),
@@ -5811,7 +5836,7 @@ mod tests {
                 headers.insert(header::IF_RANGE, v.parse().unwrap());
             }
             assert_eq!(
-                if_range_matches(&headers, &etag, &last_modified_str),
+                if_range_matches(&headers, &response_headers),
                 want,
                 "{if_range:?}"
             );
@@ -5823,18 +5848,76 @@ mod tests {
             header::IF_RANGE,
             header::HeaderValue::from_bytes(b"\"\xff\xfev2\"").unwrap(),
         );
-        assert!(!if_range_matches(&headers, &etag, &last_modified_str));
+        assert!(!if_range_matches(&headers, &response_headers));
+
+        // A weak ETag on the response cannot satisfy the strong comparison.
+        let mut weak = response_headers.clone();
+        weak.insert(header::ETAG, "W/\"v2\"".parse().unwrap());
+        let mut headers = HeaderMap::new();
+        headers.insert(header::IF_RANGE, "\"v2\"".parse().unwrap());
+        assert!(!if_range_matches(&headers, &weak));
 
         // No Last-Modified on the representation: a date validator fails,
         // an entity-tag still applies.
-        let mut headers = HeaderMap::new();
-        headers.insert(header::IF_RANGE, "\"v2\"".parse().unwrap());
-        assert!(if_range_matches(&headers, &etag, &None));
+        response_headers.remove(header::LAST_MODIFIED);
+        assert!(if_range_matches(&headers, &response_headers));
         headers.insert(
             header::IF_RANGE,
             "Sat, 24 Oct 2026 22:01:04 GMT".parse().unwrap(),
         );
-        assert!(!if_range_matches(&headers, &etag, &None));
+        assert!(!if_range_matches(&headers, &response_headers));
+    }
+
+    /// A stored ETag pair replaces the tag the response sends, so If-Range
+    /// must be judged against it rather than the calculated one.
+    #[tokio::test]
+    async fn test_if_range_matches_the_stored_etag_pair() {
+        const ID: u64 = 0x6e7a_0401;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let state = volume_test_state(&tmp);
+        let data: Vec<u8> = (0..4096u32).map(|i| (i % 251) as u8).collect();
+
+        let mut n = Needle {
+            id: NeedleId(ID),
+            cookie: Cookie(TEST_COOKIE),
+            data: data.clone(),
+            data_size: data.len() as u32,
+            pairs: br#"{"ETag":"\"stored\""}"#.to_vec(),
+            ..Needle::default()
+        };
+        n.pairs_size = n.pairs.len() as u16;
+        n.set_has_pairs();
+        state
+            .store
+            .write()
+            .unwrap()
+            .write_volume_needle(VolumeId(1), &mut n, false)
+            .unwrap();
+        let calculated = format!("\"{}\"", n.etag());
+        let path = format!("/1,{ID:x}{TEST_COOKIE:08x}");
+
+        let (status, headers) = send_get_with(
+            &state,
+            &path,
+            &[
+                (header::RANGE, "bytes=10-19"),
+                (header::IF_RANGE, "\"stored\""),
+            ],
+        )
+        .await;
+        assert_eq!(headers[header::ETAG], "\"stored\"");
+        assert_eq!(status, StatusCode::PARTIAL_CONTENT);
+
+        let (status, _) = send_get_with(
+            &state,
+            &path,
+            &[
+                (header::RANGE, "bytes=10-19"),
+                (header::IF_RANGE, calculated.as_str()),
+            ],
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
     }
 
     /// A GET whose needle read is parked must not hold the store lock: a
