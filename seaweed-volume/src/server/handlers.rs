@@ -1641,6 +1641,9 @@ fn read_response_headers(
 ) -> (HeaderMap, String) {
     let mut response_headers = HeaderMap::new();
     response_headers.insert(header::ETAG, etag.parse().unwrap());
+    if let Some(lm) = last_modified_str {
+        response_headers.insert(header::LAST_MODIFIED, lm.parse().unwrap());
+    }
 
     // H1: Emit pairs as response headers
     if n.has_pairs()
@@ -1765,11 +1768,6 @@ fn read_response_headers(
         && let Ok(hval) = cd.parse()
     {
         response_headers.insert(header::CONTENT_DISPOSITION, hval);
-    }
-
-    // Last-Modified
-    if let Some(lm) = last_modified_str {
-        response_headers.insert(header::LAST_MODIFIED, lm.parse().unwrap());
     }
 
     // H7: Content-Disposition — inline by default, attachment only when dl is truthy
@@ -5914,6 +5912,61 @@ mod tests {
             &[
                 (header::RANGE, "bytes=10-19"),
                 (header::IF_RANGE, calculated.as_str()),
+            ],
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    /// A stored Last-Modified pair is the date the response sends, so an
+    /// If-Range date validator must equal it rather than the needle's own.
+    #[tokio::test]
+    async fn test_if_range_matches_the_stored_last_modified_pair() {
+        const ID: u64 = 0x6e7a_0402;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let state = volume_test_state(&tmp);
+        let data: Vec<u8> = (0..4096u32).map(|i| (i % 251) as u8).collect();
+
+        let mut n = Needle {
+            id: NeedleId(ID),
+            cookie: Cookie(TEST_COOKIE),
+            data: data.clone(),
+            data_size: data.len() as u32,
+            last_modified: 1700000000,
+            pairs: br#"{"Last-Modified":"Sat, 24 Oct 2026 22:01:04 GMT"}"#.to_vec(),
+            ..Needle::default()
+        };
+        n.pairs_size = n.pairs.len() as u16;
+        n.set_has_pairs();
+        state
+            .store
+            .write()
+            .unwrap()
+            .write_volume_needle(VolumeId(1), &mut n, false)
+            .unwrap();
+        let path = format!("/1,{ID:x}{TEST_COOKIE:08x}");
+
+        let (status, headers) = send_get_with(
+            &state,
+            &path,
+            &[
+                (header::RANGE, "bytes=10-19"),
+                (header::IF_RANGE, "Sat, 24 Oct 2026 22:01:04 GMT"),
+            ],
+        )
+        .await;
+        assert_eq!(
+            headers[header::LAST_MODIFIED],
+            "Sat, 24 Oct 2026 22:01:04 GMT"
+        );
+        assert_eq!(status, StatusCode::PARTIAL_CONTENT);
+
+        let (status, _) = send_get_with(
+            &state,
+            &path,
+            &[
+                (header::RANGE, "bytes=10-19"),
+                (header::IF_RANGE, "Tue, 14 Nov 2023 22:13:20 GMT"),
             ],
         )
         .await;
