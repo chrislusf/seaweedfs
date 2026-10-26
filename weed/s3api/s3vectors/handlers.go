@@ -3,13 +3,19 @@ package s3vectors
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
+	"github.com/google/uuid"
+	"github.com/seaweedfs/seaweedfs/weed/glog"
 	"github.com/seaweedfs/seaweedfs/weed/pb/vector_pb"
 	"github.com/seaweedfs/seaweedfs/weed/s3api/s3tables"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/structpb"
 )
 
@@ -64,6 +70,9 @@ func arnParts(v *vectorBucketARNs, name, arn string) error {
 	rest := arn[i+len("bucket/"):]
 	parts := strings.Split(rest, "/index/")
 	v.bucket = parts[0]
+	if v.bucket == "" {
+		return fmt.Errorf("malformed ARN %q", arn)
+	}
 	if len(parts) == 2 {
 		v.index = parts[1]
 	}
@@ -81,17 +90,16 @@ func resolveIndexARNs(bucketName, bucketArn, indexName, indexArn string) (vector
 	} else if indexArn != "" {
 		return v, fmt.Errorf("indexArn must be an ARN, got %q", indexArn)
 	}
-	if strings.HasPrefix(bucketArn, "arn:") {
+	if bucketArn != "" {
+		if !strings.HasPrefix(bucketArn, "arn:") {
+			return v, fmt.Errorf("vectorBucketArn must be an ARN, got %q", bucketArn)
+		}
 		if err := arnParts(&v, "", bucketArn); err != nil {
 			return v, err
 		}
 	}
 	if v.bucket == "" {
-		if bucketArn != "" {
-			v.bucket = bucketArn
-		} else {
-			v.bucket = bucketName
-		}
+		v.bucket = bucketName
 	}
 	if v.index == "" {
 		v.index = indexName
@@ -118,25 +126,116 @@ func (s *Server) catalog(ctx context.Context, operation string, req, resp interf
 	return s.tables.Execute(ctx, s.filerClient, operation, req, resp, identityOf(r))
 }
 
-func isNotFound(err error) bool {
-	return err != nil && (strings.Contains(err.Error(), "NoSuchTableBucket") ||
-		strings.Contains(err.Error(), "NoSuchTable") ||
-		strings.Contains(err.Error(), "NotFoundException") ||
-		strings.Contains(err.Error(), "NoSuchBucket"))
+// internalCatalog runs catalog bookkeeping under the trusted identity. It is
+// for reads and writes that accompany — never replace — the operation's own
+// permission check: bucket format lookups, the implicit index namespace, and
+// rollback of a record this request just created.
+func (s *Server) internalCatalog(ctx context.Context, operation string, req, resp interface{}) error {
+	return s.internal.Execute(ctx, s.filerClient, operation, req, resp, "")
+}
+
+func tableErrCode(err error) string {
+	var apiErr *s3tables.S3TablesError
+	if errors.As(err, &apiErr) {
+		return apiErr.Type
+	}
+	return ""
 }
 
 func catalogErr(w http.ResponseWriter, err error) {
-	msg := err.Error()
-	switch {
-	case isNotFound(err):
-		writeError(w, http.StatusNotFound, "NotFoundException", msg)
-	case strings.Contains(msg, "AccessDenied") || strings.Contains(msg, "PermissionDenied"):
-		writeError(w, http.StatusForbidden, "AccessDeniedException", "access denied")
-	case strings.Contains(msg, "AlreadyExists") || strings.Contains(msg, "Conflict"):
-		writeError(w, http.StatusConflict, "ConflictException", msg)
-	default:
-		writeError(w, http.StatusBadRequest, "ValidationException", msg)
+	var apiErr *s3tables.S3TablesError
+	if !errors.As(err, &apiErr) {
+		writeError(w, http.StatusInternalServerError, "InternalFailure", "internal error")
+		return
 	}
+	switch {
+	case apiErr.Type == s3tables.ErrCodeAccessDenied:
+		writeError(w, http.StatusForbidden, "AccessDeniedException", "access denied")
+	case strings.HasPrefix(apiErr.Type, "NoSuch"):
+		writeError(w, http.StatusNotFound, "NotFoundException", apiErr.Message)
+	case strings.Contains(apiErr.Type, "AlreadyExists") || strings.Contains(apiErr.Type, "NotEmpty") ||
+		apiErr.Type == s3tables.ErrCodeConflict:
+		writeError(w, http.StatusConflict, "ConflictException", apiErr.Message)
+	case apiErr.Type == s3tables.ErrCodeInternalError:
+		writeError(w, http.StatusInternalServerError, "InternalFailure", apiErr.Message)
+	default:
+		writeError(w, http.StatusBadRequest, "ValidationException", apiErr.Message)
+	}
+}
+
+// vectorErr maps a VectorService gRPC status onto the API's error shape.
+func vectorErr(w http.ResponseWriter, err error) {
+	msg := status.Convert(err).Message()
+	switch status.Code(err) {
+	case codes.NotFound:
+		writeError(w, http.StatusNotFound, "NotFoundException", msg)
+	case codes.InvalidArgument, codes.FailedPrecondition, codes.OutOfRange:
+		writeError(w, http.StatusBadRequest, "ValidationException", msg)
+	case codes.PermissionDenied, codes.Unauthenticated:
+		writeError(w, http.StatusForbidden, "AccessDeniedException", "access denied")
+	default:
+		writeError(w, http.StatusInternalServerError, "InternalFailure", msg)
+	}
+}
+
+// lanceBucket reports whether bucket is a table bucket that can hold vector
+// indexes: a declared Lance bucket, or one made before formats existed. An
+// explicit ICEBERG bucket is not a vector bucket and reads as absent. The
+// lookup is internal so the call needs no read grant — the requested
+// operation's own permission still gates it.
+func (s *Server) lanceBucket(ctx context.Context, bucket string) error {
+	var resp struct {
+		Format string `json:"format"`
+	}
+	err := s.internalCatalog(ctx, "GetTableBucket",
+		&s3tables.GetTableBucketRequest{TableBucketARN: s.s3tablesArn(bucket)}, &resp)
+	if err != nil {
+		return err
+	}
+	if resp.Format != "" && resp.Format != s3tables.FormatLance {
+		return &s3tables.S3TablesError{
+			Type:    s3tables.ErrCodeNoSuchBucket,
+			Message: fmt.Sprintf("vector bucket %s not found", bucket),
+		}
+	}
+	return nil
+}
+
+// ensureIndexNamespace declares the implicit index namespace when absent. The
+// calls are internal: a caller's CreateTable grant is what authorizes the
+// index, so it must not also need namespace reads or writes.
+func (s *Server) ensureIndexNamespace(ctx context.Context, bucket string) error {
+	var resp map[string]interface{}
+	err := s.internalCatalog(ctx, "GetNamespace", &s3tables.GetNamespaceRequest{
+		TableBucketARN: s.s3tablesArn(bucket),
+		Namespace:      []string{indexNamespace},
+	}, &resp)
+	if err == nil {
+		return nil
+	}
+	if code := tableErrCode(err); code != s3tables.ErrCodeNoSuchNamespace && code != s3tables.ErrCodeNoSuchBucket {
+		return err
+	}
+	err = s.internalCatalog(ctx, "CreateNamespace", &s3tables.CreateNamespaceRequest{
+		TableBucketARN: s.s3tablesArn(bucket),
+		Namespace:      []string{indexNamespace},
+	}, &resp)
+	// A concurrent CreateIndex may have won the create.
+	if err != nil && tableErrCode(err) != s3tables.ErrCodeNamespaceAlreadyExists {
+		return err
+	}
+	return nil
+}
+
+// authorizeIndexWrite requires the update grant on the index's catalog table
+// — the same check credential vending uses — so a read-only GetTable grant
+// never reaches a mutation.
+func (s *Server) authorizeIndexWrite(ctx context.Context, r *http.Request, bucket, index string) error {
+	return s.tables.AuthorizeUpdateTable(ctx, s.filerClient, &s3tables.UpdateTableRequest{
+		TableBucketARN: s.s3tablesArn(bucket),
+		Namespace:      []string{indexNamespace},
+		Name:           index,
+	}, identityOf(r))
 }
 
 func (s *Server) handleCreateVectorBucket(w http.ResponseWriter, r *http.Request) {
@@ -149,6 +248,13 @@ func (s *Server) handleCreateVectorBucket(w http.ResponseWriter, r *http.Request
 		writeError(w, http.StatusBadRequest, "ValidationException", "vectorBucketName is required")
 		return
 	}
+	// The catalog has no encryption boundary to honor the configuration
+	// against; accepting it would silently promise semantics we do not keep.
+	if len(req.EncryptionConfiguration) > 0 {
+		writeError(w, http.StatusBadRequest, "ValidationException",
+			"encryptionConfiguration is not supported")
+		return
+	}
 	var resp map[string]interface{}
 	err := s.catalog(r.Context(), "CreateTableBucket",
 		&s3tables.CreateTableBucketRequest{Name: req.VectorBucketName, Format: s3tables.FormatLance}, &resp, r)
@@ -156,7 +262,7 @@ func (s *Server) handleCreateVectorBucket(w http.ResponseWriter, r *http.Request
 		catalogErr(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, &CreateVectorBucketResponse{})
+	writeJSON(w, http.StatusOK, &CreateVectorBucketResponse{VectorBucketArn: s.vectorBucketArn(req.VectorBucketName)})
 }
 
 func (s *Server) handleGetVectorBucket(w http.ResponseWriter, r *http.Request) {
@@ -175,6 +281,12 @@ func (s *Server) handleGetVectorBucket(w http.ResponseWriter, r *http.Request) {
 		&s3tables.GetTableBucketRequest{TableBucketARN: s.s3tablesArn(arns.bucket)}, &resp, r)
 	if err != nil {
 		catalogErr(w, err)
+		return
+	}
+	// An explicit ICEBERG bucket is not a vector bucket.
+	if format, _ := resp["format"].(string); format != "" && format != s3tables.FormatLance {
+		writeError(w, http.StatusNotFound, "NotFoundException",
+			fmt.Sprintf("vector bucket %s not found", arns.bucket))
 		return
 	}
 	created, _ := time.Parse(time.RFC3339, fmt.Sprint(resp["createdAt"]))
@@ -196,6 +308,7 @@ func (s *Server) handleListVectorBuckets(w http.ResponseWriter, r *http.Request)
 			Arn       string `json:"arn"`
 			Name      string `json:"name"`
 			CreatedAt string `json:"createdAt"`
+			Format    string `json:"format"`
 		} `json:"tableBuckets"`
 		ContinuationToken string `json:"continuationToken"`
 	}
@@ -207,8 +320,13 @@ func (s *Server) handleListVectorBuckets(w http.ResponseWriter, r *http.Request)
 		catalogErr(w, err)
 		return
 	}
+	// The catalog token continues the filtered page: ICEBERG buckets drop out
+	// of the listing, Lance and format-less legacy buckets stay.
 	out := &ListVectorBucketsResponse{NextToken: resp.ContinuationToken}
 	for _, b := range resp.TableBuckets {
+		if b.Format != "" && b.Format != s3tables.FormatLance {
+			continue
+		}
 		created, _ := time.Parse(time.RFC3339, b.CreatedAt)
 		out.VectorBuckets = append(out.VectorBuckets, &VectorBucket{
 			VectorBucketArn:  s.vectorBucketArn(b.Name),
@@ -230,9 +348,32 @@ func (s *Server) handleDeleteVectorBucket(w http.ResponseWriter, r *http.Request
 		writeError(w, http.StatusBadRequest, "ValidationException", err.Error())
 		return
 	}
+	// The format check needs no read grant — the delete below is the
+	// authorization boundary — but an ICEBERG bucket is not a vector bucket.
+	if err := s.lanceBucket(r.Context(), arns.bucket); err != nil {
+		catalogErr(w, err)
+		return
+	}
 	var resp map[string]interface{}
 	err := s.catalog(r.Context(), "DeleteTableBucket",
 		&s3tables.DeleteTableBucketRequest{TableBucketARN: s.s3tablesArn(arns.bucket)}, &resp, r)
+	if err != nil && tableErrCode(err) == s3tables.ErrCodeBucketNotEmpty {
+		// The implicit index namespace counts as bucket content even when it
+		// holds no indexes; drop it under the delete's own authorization and
+		// retry once. A namespace still holding indexes keeps the conflict.
+		var nsResp map[string]interface{}
+		nsErr := s.internalCatalog(context.WithoutCancel(r.Context()), "DeleteNamespace",
+			&s3tables.DeleteNamespaceRequest{
+				TableBucketARN: s.s3tablesArn(arns.bucket),
+				Namespace:      []string{indexNamespace},
+			}, &nsResp)
+		if nsErr == nil {
+			err = s.catalog(r.Context(), "DeleteTableBucket",
+				&s3tables.DeleteTableBucketRequest{TableBucketARN: s.s3tablesArn(arns.bucket)}, &resp, r)
+		} else if code := tableErrCode(nsErr); code != s3tables.ErrCodeNoSuchNamespace {
+			glog.V(1).Infof("S3 Vectors: drop internal namespace in %s: %v", arns.bucket, nsErr)
+		}
+	}
 	if err != nil {
 		catalogErr(w, err)
 		return
@@ -280,39 +421,65 @@ func (s *Server) handleCreateIndex(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "ValidationException", "dimension must be 1..=4096")
 		return
 	}
-	metadata := map[string]string{
-		"dimension":      fmt.Sprint(req.Dimension),
-		"distanceMetric": req.DistanceMetric,
-	}
-	if keys, err := json.Marshal(req.MetadataConfiguration.NonFilterableMetadataKeys); req.MetadataConfiguration != nil && err == nil {
-		metadata["nonFilterableMetadataKeys"] = string(keys)
-	}
-	metadataJSON, _ := json.Marshal(metadata)
-	var nsResp map[string]interface{}
-	// The index namespace is implicit on AWS; declare it, tolerating an
-	// already-existing namespace.
-	if err := s.catalog(r.Context(), "CreateNamespace", &s3tables.CreateNamespaceRequest{
-		TableBucketARN: s.s3tablesArn(arns.bucket),
-		Namespace:      []string{indexNamespace},
-	}, &nsResp, r); err != nil && !strings.Contains(err.Error(), "AlreadyExists") && !strings.Contains(err.Error(), "Conflict") {
+	if err := s.lanceBucket(r.Context(), arns.bucket); err != nil {
 		catalogErr(w, err)
 		return
 	}
-	var resp map[string]interface{}
+	// The namespace is implicit on AWS and internal bookkeeping here; declare
+	// it before the caller's create grant is exercised against it.
+	if err := s.ensureIndexNamespace(r.Context(), arns.bucket); err != nil {
+		catalogErr(w, err)
+		return
+	}
+	if err := s.tables.AuthorizeCreateTable(r.Context(), s.filerClient, &s3tables.CreateTableRequest{
+		TableBucketARN: s.s3tablesArn(arns.bucket),
+		Namespace:      []string{indexNamespace},
+		Name:           arns.index,
+	}, identityOf(r)); err != nil {
+		catalogErr(w, err)
+		return
+	}
+	// Only a caller who passed the create check may learn an index exists.
+	var existing map[string]interface{}
+	getErr := s.internalCatalog(r.Context(), "GetTable", &s3tables.GetTableRequest{
+		TableBucketARN: s.s3tablesArn(arns.bucket),
+		Namespace:      []string{indexNamespace},
+		Name:           arns.index,
+	}, &existing)
+	switch {
+	case getErr == nil:
+		writeError(w, http.StatusConflict, "ConflictException",
+			fmt.Sprintf("index %s already exists", arns.index))
+		return
+	case tableErrCode(getErr) != s3tables.ErrCodeNoSuchTable:
+		catalogErr(w, getErr)
+		return
+	}
+	metadata := map[string]string{
+		"dimension":      fmt.Sprint(req.Dimension),
+		"distanceMetric": req.DistanceMetric,
+		// The nonce marks the record this request created, so a rollback after
+		// an engine failure can never erase a pre-existing index.
+		"createNonce": uuid.NewString(),
+	}
+	var nonFilterable []string
+	if req.MetadataConfiguration != nil {
+		nonFilterable = req.MetadataConfiguration.NonFilterableMetadataKeys
+		if keys, err := json.Marshal(nonFilterable); err == nil {
+			metadata["nonFilterableMetadataKeys"] = string(keys)
+		}
+	}
+	metadataJSON, _ := json.Marshal(metadata)
 	err = s.catalog(r.Context(), "CreateTable", &s3tables.CreateTableRequest{
 		TableBucketARN: s.s3tablesArn(arns.bucket),
 		Namespace:      []string{indexNamespace},
 		Name:           arns.index,
 		Format:         s3tables.FormatLance,
 		Metadata:       &s3tables.TableMetadata{FullMetadata: metadataJSON},
-	}, &resp, r)
+	}, nil, r)
 	if err != nil {
 		catalogErr(w, err)
 		return
-	}
-	var nonFilterable []string
-	if req.MetadataConfiguration != nil {
-		nonFilterable = req.MetadataConfiguration.NonFilterableMetadataKeys
 	}
 	_, err = s.vectors.CreateIndex(r.Context(), &vector_pb.CreateIndexRequest{
 		Table:                     tableID(arns.bucket, arns.index),
@@ -322,16 +489,48 @@ func (s *Server) handleCreateIndex(w http.ResponseWriter, r *http.Request) {
 	})
 	if err != nil {
 		// Roll the index record back so a half-created index does not linger.
-		var delResp map[string]interface{}
-		_ = s.catalog(r.Context(), "DeleteTable", &s3tables.DeleteTableRequest{
+		// The delete runs past a client disconnect and only removes the record
+		// this request created: the nonce must match, and the versionToken
+		// compare-and-swap keeps a racing create from being erased.
+		ctx := context.WithoutCancel(r.Context())
+		var rec map[string]interface{}
+		if gerr := s.internalCatalog(ctx, "GetTable", &s3tables.GetTableRequest{
 			TableBucketARN: s.s3tablesArn(arns.bucket),
 			Namespace:      []string{indexNamespace},
 			Name:           arns.index,
-		}, &delResp, r)
-		writeError(w, http.StatusInternalServerError, "InternalFailure", err.Error())
+		}, &rec); gerr == nil && recordNonce(rec) == metadata["createNonce"] {
+			var delResp map[string]interface{}
+			if derr := s.internalCatalog(ctx, "DeleteTable", &s3tables.DeleteTableRequest{
+				TableBucketARN: s.s3tablesArn(arns.bucket),
+				Namespace:      []string{indexNamespace},
+				Name:           arns.index,
+				VersionToken:   recordVersionToken(rec),
+			}, &delResp); derr != nil {
+				glog.Errorf("S3 Vectors: rollback of catalog table %s/%s failed: %v", arns.bucket, arns.index, derr)
+			}
+		} else if gerr != nil {
+			glog.Errorf("S3 Vectors: rollback lookup for %s/%s failed: %v", arns.bucket, arns.index, gerr)
+		}
+		vectorErr(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, &CreateIndexResponse{})
+	writeJSON(w, http.StatusOK, &CreateIndexResponse{IndexArn: s.indexArn(arns.bucket, arns.index)})
+}
+
+// recordNonce and recordVersionToken read the catalog record's internal
+// bookkeeping for the create-index rollback.
+func recordNonce(record map[string]interface{}) string {
+	if meta, ok := record["metadata"].(map[string]interface{}); ok {
+		if fm, ok := meta["fullMetadata"].(map[string]interface{}); ok {
+			return fmt.Sprint(fm["createNonce"])
+		}
+	}
+	return ""
+}
+
+func recordVersionToken(record map[string]interface{}) string {
+	token, _ := record["versionToken"].(string)
+	return token
 }
 
 func indexFromRecord(s *Server, bucket, name string, m map[string]interface{}) *Index {
@@ -386,7 +585,7 @@ func (s *Server) handleGetIndex(w http.ResponseWriter, r *http.Request) {
 		catalogErr(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, &GetIndexResponse{Index: indexFromRecord(s, arns.bucket, req.IndexName, resp)})
+	writeJSON(w, http.StatusOK, &GetIndexResponse{Index: indexFromRecord(s, arns.bucket, arns.index, resp)})
 }
 
 func (s *Server) handleListIndexes(w http.ResponseWriter, r *http.Request) {
@@ -403,6 +602,7 @@ func (s *Server) handleListIndexes(w http.ResponseWriter, r *http.Request) {
 	var resp struct {
 		TableSummaries []struct {
 			Name      string `json:"name"`
+			Format    string `json:"format"`
 			CreatedAt string `json:"createdAt"`
 		} `json:"tables"`
 		ContinuationToken string `json:"continuationToken"`
@@ -418,9 +618,21 @@ func (s *Server) handleListIndexes(w http.ResponseWriter, r *http.Request) {
 		catalogErr(w, err)
 		return
 	}
+	// Summaries carry only what the catalog listing knows; a summary that
+	// asserted a dimension or metric without a record lookup would lie.
 	out := &ListIndexesResponse{NextToken: resp.ContinuationToken}
 	for _, t := range resp.TableSummaries {
-		out.Indexes = append(out.Indexes, indexFromRecord(s, arns.bucket, t.Name, nil))
+		// A non-Lance table in the index namespace is not an index.
+		if t.Format != "" && t.Format != s3tables.FormatLance {
+			continue
+		}
+		created, _ := time.Parse(time.RFC3339, t.CreatedAt)
+		out.Indexes = append(out.Indexes, &IndexSummary{
+			IndexName:        t.Name,
+			IndexArn:         s.indexArn(arns.bucket, t.Name),
+			VectorBucketName: arns.bucket,
+			CreationTime:     created,
+		})
 	}
 	writeJSON(w, http.StatusOK, out)
 }
@@ -436,9 +648,9 @@ func (s *Server) handleDeleteIndex(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "ValidationException", err.Error())
 		return
 	}
-	_, _ = s.vectors.DropIndex(r.Context(), &vector_pb.DropIndexRequest{
-		Table: tableID(arns.bucket, arns.index),
-	})
+	// Deleting the catalog record is the delete: the engine derives an index's
+	// existence from its table, and DropIndex is unimplemented on the shared
+	// service.
 	var resp map[string]interface{}
 	err = s.catalog(r.Context(), "DeleteTable", &s3tables.DeleteTableRequest{
 		TableBucketARN: s.s3tablesArn(arns.bucket),
@@ -481,10 +693,20 @@ func (s *Server) handlePutVectors(w http.ResponseWriter, r *http.Request) {
 		catalogErr(w, err)
 		return
 	}
+	// A read grant on the index does not carry a write: mutations require the
+	// catalog's update grant, the same check credential vending applies.
+	if err := s.authorizeIndexWrite(r.Context(), r, arns.bucket, arns.index); err != nil {
+		catalogErr(w, err)
+		return
+	}
 	vectors := make([]*vector_pb.Vector, 0, len(req.Vectors))
 	for _, v := range req.Vectors {
 		if v == nil {
 			writeError(w, http.StatusBadRequest, "ValidationException", "vectors contains a null element")
+			return
+		}
+		if v.Key == "" {
+			writeError(w, http.StatusBadRequest, "ValidationException", "vector key must not be empty")
 			return
 		}
 		metadata, err := metadataStruct(v.Metadata)
@@ -503,7 +725,7 @@ func (s *Server) handlePutVectors(w http.ResponseWriter, r *http.Request) {
 		Vectors: vectors,
 	})
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "InternalFailure", err.Error())
+		vectorErr(w, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, &PutVectorsResponse{})
@@ -546,7 +768,7 @@ func (s *Server) handleGetVectors(w http.ResponseWriter, r *http.Request) {
 		ReturnMetadata: req.ReturnMetadata,
 	})
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "InternalFailure", err.Error())
+		vectorErr(w, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, &GetVectorsResponse{
@@ -569,44 +791,16 @@ func (s *Server) handleListVectors(w http.ResponseWriter, r *http.Request) {
 		catalogErr(w, err)
 		return
 	}
-	// AWS exposes a static split: segmentIndex/segmentCount divides the full
-	// listing. The engine service does not know AWS segments, so page through
-	// the whole index here and slice the caller's share — O(index) per call,
-	// acceptable for the MVP.
-	if req.SegmentCount > 0 {
-		var all []*vector_pb.Vector
-		token := ""
-		for {
-			page, err := s.vectors.ListVectors(r.Context(), &vector_pb.ListVectorsRequest{
-				Table:          tableID(arns.bucket, arns.index),
-				MaxResults:     1000,
-				NextToken:      token,
-				ReturnData:     req.ReturnData,
-				ReturnMetadata: req.ReturnMetadata,
-			})
-			if err != nil {
-				writeError(w, http.StatusInternalServerError, "InternalFailure", err.Error())
-				return
-			}
-			all = append(all, page.Vectors...)
-			if page.NextToken == "" {
-				break
-			}
-			token = page.NextToken
-		}
-		var out []*vector_pb.Vector
-		for i, v := range all {
-			if i%int(req.SegmentCount) == int(req.SegmentIndex) {
-				out = append(out, v)
-			}
-		}
-		writeJSON(w, http.StatusOK, &ListVectorsResponse{
-			Vectors: toOutputVectors(out, req.ReturnData, req.ReturnMetadata),
-		})
-		return
-	}
 	if req.MaxResults < 0 {
 		writeError(w, http.StatusBadRequest, "ValidationException", "maxResults must be non-negative")
+		return
+	}
+	// AWS exposes a static split: segmentIndex/segmentCount divides the full
+	// listing. The engine service does not know AWS segments, so the gateway
+	// walks its pages in order and keeps the caller's share — paginating the
+	// share rather than silently ignoring maxResults/nextToken.
+	if req.SegmentCount > 0 || req.SegmentIndex > 0 {
+		s.listSegmented(w, r, &req, arns)
 		return
 	}
 	resp, err := s.vectors.ListVectors(r.Context(), &vector_pb.ListVectorsRequest{
@@ -617,12 +811,91 @@ func (s *Server) handleListVectors(w http.ResponseWriter, r *http.Request) {
 		ReturnMetadata: req.ReturnMetadata,
 	})
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "InternalFailure", err.Error())
+		vectorErr(w, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, &ListVectorsResponse{
 		NextToken: resp.NextToken,
 		Vectors:   toOutputVectors(resp.Vectors, req.ReturnData, req.ReturnMetadata),
+	})
+}
+
+// listSegmented serves the static segmentIndex/segmentCount split. Engine
+// tokens are row offsets, so the emitted nextToken records the page holding
+// the resume row and the row index to resume at: "seg:<pageStart>:<nextIndex>".
+// Scanning rows outside the segment costs a fetch but keeps the split a pure
+// filter over the engine's own ordering.
+func (s *Server) listSegmented(w http.ResponseWriter, r *http.Request, req *ListVectorsRequest, arns vectorBucketARNs) {
+	if req.SegmentCount < 1 || req.SegmentCount > 16 ||
+		req.SegmentIndex < 0 || req.SegmentIndex >= req.SegmentCount {
+		writeError(w, http.StatusBadRequest, "ValidationException",
+			"segmentCount must be 1..=16 and segmentIndex must be less than segmentCount")
+		return
+	}
+	limit := req.MaxResults
+	if limit <= 0 {
+		limit = 500 // the service default page size
+	}
+	token := ""
+	var resume uint64
+	if req.NextToken != "" {
+		parts := strings.SplitN(req.NextToken, ":", 3)
+		if len(parts) != 3 || parts[0] != "seg" {
+			writeError(w, http.StatusBadRequest, "ValidationException", "invalid nextToken")
+			return
+		}
+		pageStart, err1 := strconv.ParseUint(parts[1], 10, 64)
+		nextIndex, err2 := strconv.ParseUint(parts[2], 10, 64)
+		if err1 != nil || err2 != nil || nextIndex <= pageStart {
+			writeError(w, http.StatusBadRequest, "ValidationException", "invalid nextToken")
+			return
+		}
+		resume = nextIndex
+		token = strconv.FormatUint(pageStart, 10)
+	}
+	out := make([]*vector_pb.Vector, 0, min(limit, 1000))
+	for len(out) < limit {
+		pageBase, _ := strconv.ParseUint(token, 10, 64) // "" parses as 0
+		pageStart := strconv.FormatUint(pageBase, 10)
+		page, err := s.vectors.ListVectors(r.Context(), &vector_pb.ListVectorsRequest{
+			Table:          tableID(arns.bucket, arns.index),
+			MaxResults:     1000,
+			NextToken:      token,
+			ReturnData:     req.ReturnData,
+			ReturnMetadata: req.ReturnMetadata,
+		})
+		if err != nil {
+			vectorErr(w, err)
+			return
+		}
+		for i, v := range page.Vectors {
+			idx := pageBase + uint64(i)
+			if idx < resume {
+				continue
+			}
+			resume = idx + 1
+			if idx%uint64(req.SegmentCount) == uint64(req.SegmentIndex) {
+				out = append(out, v)
+				if len(out) == limit {
+					next := ""
+					if i+1 < len(page.Vectors) || page.NextToken != "" {
+						next = fmt.Sprintf("seg:%s:%d", pageStart, resume)
+					}
+					writeJSON(w, http.StatusOK, &ListVectorsResponse{
+						NextToken: next,
+						Vectors:   toOutputVectors(out, req.ReturnData, req.ReturnMetadata),
+					})
+					return
+				}
+			}
+		}
+		if page.NextToken == "" || len(page.Vectors) == 0 {
+			break
+		}
+		token = page.NextToken
+	}
+	writeJSON(w, http.StatusOK, &ListVectorsResponse{
+		Vectors: toOutputVectors(out, req.ReturnData, req.ReturnMetadata),
 	})
 }
 
@@ -641,12 +914,16 @@ func (s *Server) handleDeleteVectors(w http.ResponseWriter, r *http.Request) {
 		catalogErr(w, err)
 		return
 	}
+	if err := s.authorizeIndexWrite(r.Context(), r, arns.bucket, arns.index); err != nil {
+		catalogErr(w, err)
+		return
+	}
 	_, err = s.vectors.DeleteVectors(r.Context(), &vector_pb.DeleteVectorsRequest{
 		Table: tableID(arns.bucket, arns.index),
 		Keys:  req.Keys,
 	})
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "InternalFailure", err.Error())
+		vectorErr(w, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, &DeleteVectorsResponse{})
@@ -701,20 +978,56 @@ func filterExpr(filter map[string]interface{}) (string, error) {
 	return strings.Join(parts, " AND "), nil
 }
 
+// fieldAccess renders the JSONB extractor for the operand's type. The second
+// argument of the json_get_* family is a plain field name, not a JSONPath —
+// only json_exists parses JSONPath.
+func fieldAccess(field string, operand interface{}) (string, error) {
+	fn := "json_get_string"
+	switch operand.(type) {
+	case float64:
+		fn = "json_get_float"
+	case bool:
+		fn = "json_get_bool"
+	case string:
+	default:
+		return "", fmt.Errorf("unsupported filter operand %v", operand)
+	}
+	return fmt.Sprintf("%s(`metadata`, '%s')", fn, sqlEscape(field)), nil
+}
+
+// existsPath renders the field as a JSONPath for json_exists: bracket notation
+// keeps dots, spaces, and other specials inside the key literal.
+func existsPath(field string) string {
+	field = strings.ReplaceAll(field, `\`, `\\`)
+	field = strings.ReplaceAll(field, `"`, `\"`)
+	return `$["` + field + `"]`
+}
+
+func sqlEscape(s string) string {
+	return strings.ReplaceAll(s, "'", "''")
+}
+
 func fieldClause(field string, cond interface{}) (string, error) {
-	col := fmt.Sprintf("json_get_str(`metadata`, '%s')", strings.ReplaceAll(field, "'", "''"))
 	switch c := cond.(type) {
 	case map[string]interface{}:
 		parts := []string{}
 		for op, operand := range c {
 			switch op {
 			case "$exists":
-				if operand == true {
-					parts = append(parts, fmt.Sprintf("json_exists(`metadata`, '%s')", strings.ReplaceAll(field, "'", "''")))
+				if b, ok := operand.(bool); ok {
+					expr := fmt.Sprintf("json_exists(`metadata`, '%s')", sqlEscape(existsPath(field)))
+					if !b {
+						expr = "NOT " + expr
+					}
+					parts = append(parts, expr)
 				} else {
-					parts = append(parts, fmt.Sprintf("NOT json_exists(`metadata`, '%s')", strings.ReplaceAll(field, "'", "''")))
+					return "", fmt.Errorf("$exists expects a boolean")
 				}
 			case "$eq", "$ne":
+				col, err := fieldAccess(field, operand)
+				if err != nil {
+					return "", err
+				}
 				lit, err := sqlLiteral(operand)
 				if err != nil {
 					return "", err
@@ -729,33 +1042,53 @@ func fieldClause(field string, cond interface{}) (string, error) {
 				if !ok {
 					return "", fmt.Errorf("%s expects a list", op)
 				}
-				lits := make([]string, 0, len(list))
+				if len(list) == 0 {
+					if op == "$in" {
+						parts = append(parts, "false")
+					} else {
+						parts = append(parts, "true")
+					}
+					continue
+				}
+				// Members may mix types; each extractor only sees its own.
+				var groups []string
 				for _, item := range list {
+					col, err := fieldAccess(field, item)
+					if err != nil {
+						return "", err
+					}
 					lit, err := sqlLiteral(item)
 					if err != nil {
 						return "", err
 					}
-					lits = append(lits, lit)
+					groups = append(groups, fmt.Sprintf("%s in (%s)", col, lit))
 				}
-				neg := ""
+				expr := "(" + strings.Join(groups, " OR ") + ")"
 				if op == "$nin" {
-					neg = "NOT "
+					expr = "NOT " + expr
 				}
-				parts = append(parts, fmt.Sprintf("%s%s in (%s)", neg, col, strings.Join(lits, ", ")))
+				parts = append(parts, expr)
 			case "$lt", "$lte", "$gt", "$gte":
+				if _, ok := operand.(float64); !ok {
+					return "", fmt.Errorf("%s expects a number", op)
+				}
 				lit, err := sqlLiteral(operand)
 				if err != nil {
 					return "", err
 				}
 				sym := map[string]string{"$lt": "<", "$lte": "<=", "$gt": ">", "$gte": ">="}[op]
-				numCol := fmt.Sprintf("json_get_float(`metadata`, '%s')", strings.ReplaceAll(field, "'", "''"))
-				parts = append(parts, fmt.Sprintf("%s %s %s", numCol, sym, lit))
+				col := fmt.Sprintf("json_get_float(`metadata`, '%s')", sqlEscape(field))
+				parts = append(parts, fmt.Sprintf("%s %s %s", col, sym, lit))
 			default:
 				return "", fmt.Errorf("unsupported operator %s", op)
 			}
 		}
 		return strings.Join(parts, " AND "), nil
 	default:
+		col, err := fieldAccess(field, cond)
+		if err != nil {
+			return "", err
+		}
 		lit, err := sqlLiteral(cond)
 		if err != nil {
 			return "", err
@@ -809,8 +1142,8 @@ func (s *Server) handleQueryVectors(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "ValidationException", err.Error())
 		return
 	}
-	if req.TopK < 0 {
-		writeError(w, http.StatusBadRequest, "ValidationException", "topK must be non-negative")
+	if req.TopK <= 0 {
+		writeError(w, http.StatusBadRequest, "ValidationException", "topK must be positive")
 		return
 	}
 	resp, err := s.vectors.QueryVectors(r.Context(), &vector_pb.QueryVectorsRequest{
@@ -822,7 +1155,7 @@ func (s *Server) handleQueryVectors(w http.ResponseWriter, r *http.Request) {
 		ReturnDistance: req.ReturnDistance,
 	})
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "InternalFailure", err.Error())
+		vectorErr(w, err)
 		return
 	}
 	out := &QueryVectorsResponse{DistanceMetric: metric}
