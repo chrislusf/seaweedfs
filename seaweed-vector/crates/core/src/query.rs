@@ -96,7 +96,7 @@ fn scanner(
         .use_index(use_index)
         .with_row_id();
     if let Some(filter) = &query.filter {
-        scanner.filter(filter)?;
+        scanner.filter(filter)?.prefilter(true);
     }
     if let Some(nprobes) = query.nprobes {
         scanner.nprobes(nprobes);
@@ -322,5 +322,30 @@ mod tests {
             indexed.iter().map(|h| &h.key).collect::<Vec<_>>(),
             exact.iter().map(|h| &h.key).collect::<Vec<_>>()
         );
+    }
+    #[tokio::test]
+    async fn filter_prefilters_before_top_k() {
+        let dir = TempDir::new().unwrap();
+        let vectors = vec![
+            vec![1.0, 0.0, 0.0, 0.0],
+            vec![0.9, 0.1, 0.0, 0.0],
+            vec![0.0, 1.0, 0.0, 0.0],
+        ];
+        let dataset = write_dataset(&dir, &vectors, &["a", "a", "b"]).await;
+        let table = VectorTable::resolve(&dataset, None, None).unwrap();
+        let query = Query {
+            vector: vec![1.0, 0.0, 0.0, 0.0],
+            k: 1,
+            filter: Some("tag = 'b'".to_string()),
+            distance: DistanceType::L2,
+            nprobes: None,
+        };
+        for hits in [
+            flat(&dataset, &table, &query).await.unwrap(),
+            ann(&dataset, &table, &query).await.unwrap(),
+        ] {
+            assert_eq!(hits.len(), 1);
+            assert_eq!(hits[0].key, "k2");
+        }
     }
 }
