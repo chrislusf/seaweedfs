@@ -169,7 +169,11 @@ mod tests {
         )
     }
 
-    async fn write_dataset(dir: &TempDir, vectors: &[Vec<f32>], tags: &[&str]) -> Dataset {
+    fn rows_batch(
+        keys: Vec<String>,
+        vectors: &[Vec<f32>],
+        tags: &[&str],
+    ) -> (Arc<Schema>, RecordBatch) {
         let schema = Arc::new(Schema::new(vec![
             Field::new("key", DataType::Utf8, false),
             Field::new(
@@ -182,7 +186,6 @@ mod tests {
             ),
             Field::new("tag", DataType::Utf8, true),
         ]));
-        let keys: Vec<String> = (0..vectors.len()).map(|i| format!("k{i}")).collect();
         let batch = RecordBatch::try_new(
             schema.clone(),
             vec![
@@ -194,8 +197,31 @@ mod tests {
             ],
         )
         .unwrap();
+        (schema, batch)
+    }
+
+    async fn write_dataset(dir: &TempDir, vectors: &[Vec<f32>], tags: &[&str]) -> Dataset {
+        let keys = (0..vectors.len()).map(|i| format!("k{i}")).collect();
+        let (schema, batch) = rows_batch(keys, vectors, tags);
         let reader = RecordBatchIterator::new(vec![Ok(batch)].into_iter(), schema);
         Dataset::write(reader, dir.path().to_str().unwrap(), None)
+            .await
+            .unwrap()
+    }
+
+    async fn append_dataset(
+        dir: &TempDir,
+        keys: Vec<String>,
+        vectors: &[Vec<f32>],
+        tags: &[&str],
+    ) -> Dataset {
+        let (schema, batch) = rows_batch(keys, vectors, tags);
+        let reader = RecordBatchIterator::new(vec![Ok(batch)].into_iter(), schema);
+        let params = lance::dataset::WriteParams {
+            mode: lance::dataset::WriteMode::Append,
+            ..Default::default()
+        };
+        Dataset::write(reader, dir.path().to_str().unwrap(), Some(params))
             .await
             .unwrap()
     }
@@ -347,5 +373,48 @@ mod tests {
             assert_eq!(hits.len(), 1);
             assert_eq!(hits[0].key, "k2");
         }
+    }
+    #[tokio::test]
+    async fn ann_covers_rows_written_after_the_index() {
+        use lance::index::DatasetIndexExt;
+        use lance::index::vector::VectorIndexParams;
+        use lance_index::IndexType;
+
+        let dir = TempDir::new().unwrap();
+        let vectors = vec![
+            vec![0.0, 1.0, 0.0, 0.0],
+            vec![0.0, 0.0, 1.0, 0.0],
+            vec![0.0, 0.0, 0.0, 1.0],
+        ];
+        let mut dataset = write_dataset(&dir, &vectors, &["a", "a", "a"]).await;
+        let params = VectorIndexParams::ivf_flat(1, DistanceType::L2);
+        dataset
+            .create_index(&["vector"], IndexType::Vector, None, &params, true)
+            .await
+            .unwrap();
+
+        let appended = append_dataset(
+            &dir,
+            vec!["k3".to_string()],
+            &[vec![1.0, 0.0, 0.0, 0.0]],
+            &["b"],
+        )
+        .await;
+        let table = VectorTable::resolve(&appended, None, None).unwrap();
+        let mut query = Query {
+            vector: vec![1.0, 0.0, 0.0, 0.0],
+            k: 1,
+            filter: None,
+            distance: DistanceType::L2,
+            nprobes: None,
+        };
+        let hits = ann(&appended, &table, &query).await.unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].key, "k3");
+
+        query.filter = Some("tag = 'b'".to_string());
+        let hits = ann(&appended, &table, &query).await.unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].key, "k3");
     }
 }
