@@ -27,9 +27,16 @@ PIDS+=($!)
   -vectors.grpc 127.0.0.1:9301 &
 PIDS+=($!)
 
+# The mini namespace vends no STS credentials, so give the engine
+# object_store's S3 option names to reach SeaweedFS S3 directly.
 ./weed-vector-server \
   --namespace http://127.0.0.1:9102 \
-  --listen 127.0.0.1:9301 &
+  --listen 127.0.0.1:9301 \
+  --storage-option aws_access_key_id=test \
+  --storage-option aws_secret_access_key=test \
+  --storage-option aws_region=us-east-1 \
+  --storage-option aws_endpoint=http://127.0.0.1:8333 \
+  --storage-option allow_http=true &
 PIDS+=($!)
 
 # Any HTTP response (even an auth rejection) means the lance catalog is up.
