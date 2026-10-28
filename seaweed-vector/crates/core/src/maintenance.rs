@@ -23,7 +23,10 @@ const FOREIGN_TTL: Duration = Duration::from_secs(24 * 3600);
 const REAP_INTERVAL: Duration = Duration::from_secs(60);
 /// A process-unique owner id embedded in lease tags so a reaper only applies
 /// the short TTL to its own leases.
-static INSTANCE: LazyLock<String> = LazyLock::new(|| Uuid::new_v4().simple().to_string());
+/// Prefixed so an all-digit UUID never parses as a legacy timestamp.
+static INSTANCE: LazyLock<String> = LazyLock::new(|| {
+    format!("w{}", Uuid::new_v4().simple())
+});
 /// Nanos since the Unix epoch when each dataset last had its tags scanned,
 /// keyed by dataset uri.
 static LAST_REAP: LazyLock<Mutex<HashMap<String, u128>>> = LazyLock::new(Mutex::default);
